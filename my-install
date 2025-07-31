@@ -75,7 +75,6 @@ cat << EOF > /usr/local/etc/xray/config.json
                     "dest": "wikipedia.org:443",
                     "xver": 0,
                     "serverNames": [
-                        "wikipedia.org",
                         "www.wikipedia.org"
                     ],
                     "privateKey": "$privatkey",
