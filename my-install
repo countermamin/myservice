@@ -23,10 +23,10 @@ grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_q
 grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
 
 echo "[3/9] Сертификат Let's Encrypt для ${DOMAIN}"
-curl https://get.acme.sh | sh -s email=${LE_EMAIL} --force
+curl https://get.acme.sh | sh -s email=${LE_EMAIL}
 ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 mkdir -p /etc/hysteria/certs
-~/.acme.sh/acme.sh --issue -d ${DOMAIN} --standalone --keylength ec-256
+~/.acme.sh/acme.sh --issue -d ${DOMAIN} --standalone --keylength ec-256 --force
 ~/.acme.sh/acme.sh --install-cert -d ${DOMAIN} --ecc \
   --key-file       /etc/hysteria/certs/privkey.pem \
   --fullchain-file /etc/hysteria/certs/fullchain.pem
