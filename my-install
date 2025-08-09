@@ -1,297 +1,428 @@
-#!/bin/bash
-apt update
-apt install qrencode curl jq -y
-ufw allow 443/tcp
-ufw reload
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Включаем bbr
-bbr=$(sysctl -a | grep net.ipv4.tcp_congestion_control)
-if [ "$bbr" = "net.ipv4.tcp_congestion_control = bbr" ]; then
-echo "bbr уже включен"
-else
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-sysctl -p
-echo "bbr включен"
+DOMAIN="sb1.marza.online"
+LE_EMAIL="orzu-1998@mail.ru"
+BOT_TOKEN="8014597136:AAHIzJ0v73KOeojUF71GZl80VnDzwelMlY8"
+ADMIN_ID="956538433"
+HY2_PORT="443"
+
+echo "[1/9] Обновления и зависимости"
+apt update -y
+apt install -y curl wget jq qrencode socat unzip ufw python3 python3-venv python3-pip git
+
+echo "[2/9] UFW и BBR"
+ufw allow ${HY2_PORT}/tcp || true
+ufw allow ${HY2_PORT}/udp || true
+ufw --force enable || true
+sysctl -w net.core.default_qdisc=fq >/dev/null || true
+sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null || true
+grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+
+echo "[3/9] Сертификат Let's Encrypt для ${DOMAIN}"
+curl https://get.acme.sh | sh -s email=${LE_EMAIL}
+~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+mkdir -p /etc/hysteria/certs
+~/.acme.sh/acme.sh --issue -d ${DOMAIN} --standalone --keylength ec-256
+~/.acme.sh/acme.sh --install-cert -d ${DOMAIN} --ecc \
+  --key-file       /etc/hysteria/certs/privkey.pem \
+  --fullchain-file /etc/hysteria/certs/fullchain.pem
+
+echo "[4/9] Установка sing-box (Hysteria2)"
+ARCH=$(uname -m)
+if [[ "$ARCH" == "x86_64" ]]; then SB_ARCH="amd64"
+elif [[ "$ARCH" == "aarch64" ]]; then SB_ARCH="arm64"
+else echo "Unsupported arch: $ARCH"; exit 1; fi
+TMP=$(mktemp -d)
+cd "$TMP"
+SB_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+wget -qO sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
+tar -xzf sb.tar.gz
+install -m 0755 sing-box-*/sing-box /usr/local/bin/sing-box
+cd / && rm -rf "$TMP"
+
+echo "[5/9] Конфиг и база пользователей"
+mkdir -p /etc/hysteria /var/lib/hysteria /opt/hy2bot
+# users.json — словарь {"username":{"password":"..."}}
+if [[ ! -f /etc/hysteria/users.json ]]; then
+  pw=$(openssl rand -base64 18 | tr -d '=+/')
+  jq -n --arg p "$pw" '{main: {password: $p}}' > /etc/hysteria/users.json
 fi
 
-# Устанавливаем ядро Xray
-bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-[ -f /usr/local/etc/xray/.keys ] && rm /usr/local/etc/xray/.keys
-touch /usr/local/etc/xray/.keys
-echo "uuid: $(xray uuid)" >> /usr/local/etc/xray/.keys
-xray x25519 >> /usr/local/etc/xray/.keys
-echo "shortsid: $(openssl rand -hex 8)" >> /usr/local/etc/xray/.keys
-export uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
-export privatkey=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Private key/ {print $2}')
-export shortsid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-
-# Создаем файл конфигурации Xray
-touch /usr/local/etc/xray/config.json
-cat << EOF > /usr/local/etc/xray/config.json
+cat >/etc/hysteria/config.json <<JSON
 {
-    "log": {
-        "loglevel": "warning"
+  "log": { "level": "warn" },
+  "inbounds": [{
+    "type": "hysteria2",
+    "tag": "hy2-in",
+    "listen": ":${HY2_PORT}",
+    "users": [],
+    "tls": {
+      "enabled": true,
+      "certificate_path": "/etc/hysteria/certs/fullchain.pem",
+      "key_path": "/etc/hysteria/certs/privkey.pem",
+      "alpn": ["h3"]
     },
-    "routing": {
-        "domainStrategy": "IPIfNonMatch",
-        "rules": [
-            {
-                "type": "field",
-                "domain": [
-                    "geosite:category-ads-all"
-                ],
-                "outboundTag": "block"
-            },
-            {
-                "type": "field",
-                "ip": [
-                    "geoip:cn"
-                ],
-                "outboundTag": "block"
-            }
-        ]
-    },
-    "inbounds": [
-        {
-            "listen": "0.0.0.0",
-            "port": 443,
-            "protocol": "vless",
-            "settings": {
-                "clients": [
-                    {
-                        "email": "main",
-                        "id": "$uuid",
-                        "flow": "xtls-rprx-vision"
-                    }
-                ],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": "github.com:443",
-                    "xver": 0,
-                    "serverNames": [
-                        "www.github.com"
-                    ],
-                    "privateKey": "$privatkey",
-                    "minClientVer": "",
-                    "maxClientVer": "",
-                    "maxTimeDiff": 0,
-                    "shortIds": [
-                        "$shortsid"
-                    ]
-                }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "freedom",
-            "tag": "direct"
-        },
-        {
-            "protocol": "blackhole",
-            "tag": "block"
-        }
-    ],
-    "policy": {
-        "levels": {
-            "0": {
-                "handshake": 3,
-                "connIdle": 180
-            }
-        }
-    }
+    "masquerade": { "type": "proxy", "url": "https://www.bing.com/" },
+    "quic": { "initStreamReceiveWindow": 26843545 }
+  }]
 }
-EOF
+JSON
 
-# Исполняемый файл для списка клиентов
-touch /usr/local/bin/userlist
-cat << 'EOF' > /usr/local/bin/userlist
-#!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' "/usr/local/etc/xray/config.json"))
+cat >/etc/systemd/system/sing-box.service <<'UNIT'
+[Unit]
+Description=sing-box (Hysteria2)
+After=network-online.target
+Wants=network-online.target
 
-if [[ ${#emails[@]} -eq 0 ]]; then
-    echo "Список клиентов пуст"
-    exit 1
-fi
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/hysteria/config.json
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
-echo "Список клиентов:"
-for i in "${!emails[@]}"; do
-    echo "$((i+1)). ${emails[$i]}"
-done
-EOF
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Рендерим users в config.json
+python3 - <<'PY'
+import json
+cfg=json.load(open('/etc/hysteria/config.json'))
+users=json.load(open('/etc/hysteria/users.json'))
+cfg["inbounds"][0]["users"]=[{"name":k,"password":v["password"]} for k,v in users.items()]
+open('/etc/hysteria/config.json','w').write(json.dumps(cfg,indent=2))
+PY
+
+systemctl daemon-reload
+systemctl enable --now sing-box
+
+echo "[6/9] Хелперы (mainuser/newuser/rmuser/userlist/sharelink)"
+
+cat >/usr/local/bin/_hy2_render <<'BASH'
+#!/usr/bin/env bash
+set -e
+DOMAIN="__DOMAIN__"
+PORT="__PORT__"
+python3 - <<PY
+import json,base64,sys,os
+DOM=os.environ.get("DOM","__DOMAIN__")
+PORT=os.environ.get("PORT","__PORT__")
+users=json.load(open("/etc/hysteria/users.json"))
+def b64url(s): 
+    b=base64.b64encode(s.encode()).decode().rstrip("=")
+    return b.replace("+","-").replace("/","_")
+for name,info in users.items():
+    pw=info["password"]
+    enc=b64url(pw)
+    uri=f"hy2://{enc}@{DOM}:{PORT}/?sni={DOM}&alpn=h3#{name}"
+    print(f"{name} {uri}")
+PY
+BASH
+sed -i "s/__DOMAIN__/${DOMAIN}/g;s/__PORT__/${HY2_PORT}/g" /usr/local/bin/_hy2_render
+chmod +x /usr/local/bin/_hy2_render
+
+cat >/usr/local/bin/userlist <<'BASH'
+#!/usr/bin/env bash
+jq -r 'keys[]' /etc/hysteria/users.json | nl -w1 -s'. ' || echo "Пусто"
+BASH
 chmod +x /usr/local/bin/userlist
 
-# исполняемый файл для ссылки основного пользователя
-touch /usr/local/bin/mainuser
-cat << 'EOF' > /usr/local/bin/mainuser
-#!/bin/bash
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Public key/ {print $2}')
-sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(timeout 3 curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#vless-$ip"
+cat >/usr/local/bin/mainuser <<'BASH'
+#!/usr/bin/env bash
+set -e
+line=$(/usr/local/bin/_hy2_render | awk '$1=="main"{print $0}')
+name=$(echo "$line" | awk '{print $1}')
+uri=$(echo "$line" | awk '{print $2}')
+echo "Ссылка для $name:"
+echo "$uri"
 echo ""
-echo "Ссылка для подключения":
-echo "$link"
-echo ""
-echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
-EOF
+echo "QR:"
+echo "$uri" | qrencode -t ansiutf8
+BASH
 chmod +x /usr/local/bin/mainuser
 
-# Исполняемый файл для создания новых клиентов
-touch /usr/local/bin/newuser
-cat << 'EOF' > /usr/local/bin/newuser
-#!/bin/bash
-read -p "Введите имя пользователя (email): " email
-
-    if [[ -z "$email" || "$email" == *" "* ]]; then
-    echo "Имя пользователя не может быть пустым или содержать пробелы. Попробуйте снова."
-    exit 1
-    fi
-user_json=$(jq --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
-
-if [[ -z "$user_json" ]]; then
-uuid=$(xray uuid)
-jq --arg email "$email" --arg uuid "$uuid" '.inbounds[0].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
-systemctl restart xray
-index=$(jq --arg email "$email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Public key/ {print $2}')
-sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
+cat >/usr/local/bin/sharelink <<'BASH'
+#!/usr/bin/env bash
+set -e
+mapfile -t names < <(jq -r 'keys[]' /etc/hysteria/users.json)
+if [[ ${#names[@]} -eq 0 ]]; then echo "Пусто"; exit 1; fi
+for i in "${!names[@]}"; do echo "$((i+1)). ${names[$i]}"; done
+read -p "Выберите клиента: " idx
+if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#names[@]} )); then echo "Неверный"; exit 1; fi
+who="${names[$((idx-1))]}"
+uri=$(/usr/local/bin/_hy2_render | awk -v w="$who" '$1==w{print $2}')
+echo "Ссылка для $who:"
+echo "$uri"
 echo ""
-echo "Ссылка для подключения":
-echo "$link"
-echo ""
-echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
-else
-echo "Пользователь с таким именем уже существует. Попробуйте снова." 
-fi
-EOF
-chmod +x /usr/local/bin/newuser
-
-# Исполняемый файл для удаления клиентов
-touch /usr/local/bin/rmuser
-cat << 'EOF' > /usr/local/bin/rmuser
-#!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' "/usr/local/etc/xray/config.json"))
-
-if [[ ${#emails[@]} -eq 0 ]]; then
-    echo "Нет клиентов для удаления."
-    exit 1
-fi
-
-echo "Список клиентов:"
-for i in "${!emails[@]}"; do
-    echo "$((i+1)). ${emails[$i]}"
-done
-
-read -p "Введите номер клиента для удаления: " choice
-
-if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#emails[@]} )); then
-    echo "Ошибка: номер должен быть от 1 до ${#emails[@]}"
-    exit 1
-fi
-
-selected_email="${emails[$((choice - 1))]}"
-
-jq --arg email "$selected_email" \
-   '(.inbounds[0].settings.clients) |= map(select(.email != $email))' \
-   "/usr/local/etc/xray/config.json" > tmp && mv tmp "/usr/local/etc/xray/config.json"
-
-systemctl restart xray
-
-echo "Клиент $selected_email удалён."
-EOF
-chmod +x /usr/local/bin/rmuser
-
-# Исполняемый файл для вывода списка пользователей и создания ссылкок
-touch /usr/local/bin/sharelink
-cat << 'EOF' > /usr/local/bin/sharelink
-#!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json))
-
-for i in "${!emails[@]}"; do
-   echo "$((i + 1)). ${emails[$i]}"
-done
-
-read -p "Выберите клиента: " client
-
-if ! [[ "$client" =~ ^[0-9]+$ ]] || (( client < 1 || client > ${#emails[@]} )); then
-    echo "Ошибка: номер должен быть от 1 до ${#emails[@]}"
-    exit 1
-fi
-
-selected_email="${emails[$((client - 1))]}"
-
-
-index=$(jq --arg email "$selected_email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json) 
-uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Public key/ {print $2}')
-sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
-echo ""
-echo "Ссылка для подключения":
-echo "$link"
-echo ""
-echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
-EOF
+echo "QR:"
+echo "$uri" | qrencode -t ansiutf8
+BASH
 chmod +x /usr/local/bin/sharelink
 
-systemctl restart xray
+cat >/usr/local/bin/newuser <<'BASH'
+#!/usr/bin/env bash
+set -e
+read -p "Введите имя пользователя: " name
+[[ -z "$name" || "$name" =~ \  ]] && { echo "Неверное имя"; exit 1; }
+if jq -e --arg n "$name" '.[$n]' /etc/hysteria/users.json >/dev/null; then
+  echo "Пользователь уже существует"; exit 1
+fi
+pw=$(openssl rand -base64 18 | tr -d '=+/')
+tmp=$(mktemp)
+jq --arg n "$name" --arg p "$pw" '. + {($n): {"password": $p}}' /etc/hysteria/users.json > "$tmp" && mv "$tmp" /etc/hysteria/users.json
+python3 - <<'PY'
+import json
+cfg=json.load(open('/etc/hysteria/config.json'))
+users=json.load(open('/etc/hysteria/users.json'))
+cfg["inbounds"][0]["users"]=[{"name":k,"password":v["password"]} for k,v in users.items()]
+open('/etc/hysteria/config.json','w').write(json.dumps(cfg,indent=2))
+PY
+systemctl restart sing-box
+/usr/local/bin/sharelink
+BASH
+chmod +x /usr/local/bin/newuser
 
-echo "Xray-core успешно установлен"
-mainuser
+cat >/usr/local/bin/rmuser <<'BASH'
+#!/usr/bin/env bash
+set -e
+mapfile -t names < <(jq -r 'keys[]' /etc/hysteria/users.json)
+if [[ ${#names[@]} -eq 0 ]]; then echo "Нет пользователей"; exit 1; fi
+for i in "${!names[@]}"; do echo "$((i+1)). ${names[$i]}"; done
+read -p "Номер для удаления: " idx
+if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#names[@]} )); then echo "Неверный"; exit 1; fi
+name="${names[$((idx-1))]}"
+tmp=$(mktemp)
+jq --arg n "$name" 'del(.[$n])' /etc/hysteria/users.json > "$tmp" && mv "$tmp" /etc/hysteria/users.json
+python3 - <<'PY'
+import json
+cfg=json.load(open('/etc/hysteria/config.json'))
+users=json.load(open('/etc/hysteria/users.json'))
+cfg["inbounds"][0]["users"]=[{"name":k,"password":v["password"]} for k,v in users.items()]
+open('/etc/hysteria/config.json','w').write(json.dumps(cfg,indent=2))
+PY
+systemctl restart sing-box
+echo "Удалён: $name"
+BASH
+chmod +x /usr/local/bin/rmuser
 
-# Создаем файл с подсказками
-touch $HOME/help
-cat << 'EOF' > $HOME/help
+echo "[7/9] Telegram-бот (клиент+админ)"
+cat >/opt/hy2bot/.env <<ENV
+BOT_TOKEN=${BOT_TOKEN}
+ADMIN_ID=${ADMIN_ID}
+DOMAIN=${DOMAIN}
+PORT=${HY2_PORT}
+ENV
 
-Команды для управления пользователями Xray:
+cat >/opt/hy2bot/requirements.txt <<'REQ'
+aiogram==3.6.0
+python-dotenv==1.0.1
+REQ
 
-    mainuser - выводит ссылку для подключения основного пользователя
-    newuser - создает нового пользователя
-    rmuser - удаление пользователей
-    sharelink - выводит список пользователей и позволяет создать для них ссылки для подключения
-    userlist - выводит список клиентов
+cat >/opt/hy2bot/bot.py <<'PY'
+import os, json, base64, secrets, subprocess, asyncio
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from dotenv import load_dotenv
 
+load_dotenv("/opt/hy2bot/.env")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID","0"))
+DOMAIN = os.getenv("DOMAIN","localhost")
+PORT = os.getenv("PORT","443")
 
+USERS = "/etc/hysteria/users.json"
+ORDERS = "/opt/hy2bot/orders.json"  # временная таблица заявок {user_id:{plan,username,photo_id}}
+if not os.path.exists(ORDERS):
+    with open(ORDERS,"w") as f: json.dump({}, f)
 
-Файл конфигурации находится по адресу:
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+rt = Router()
+dp.include_router(rt)
 
-    /usr/local/etc/xray/config.json
+PLANS = [("1 месяц","1m"), ("3 месяца","3m"), ("6 месяцев","6m"), ("12 месяцев","12m")]
 
-Команда для перезагрузки ядра Xray:
+def b64url(s: str) -> str:
+    b = base64.b64encode(s.encode()).decode().rstrip("=")
+    return b.replace("+","-").replace("/","_")
 
-    systemctl restart xray
+def make_uri(name: str, pw: str) -> str:
+    enc = b64url(pw)
+    return f"hy2://{enc}@{DOMAIN}:{PORT}/?sni={DOMAIN}&alpn=h3#{name}"
 
-EOF
+def add_user(name: str) -> str:
+    os.makedirs(os.path.dirname(USERS), exist_ok=True)
+    with open(USERS,"r") as f:
+        users = json.load(f)
+    if name in users:
+        pw = users[name]["password"]
+    else:
+        pw = secrets.token_urlsafe(18).replace("-","").replace("_","")
+        users[name] = {"password": pw}
+        tmp = USERS + ".tmp"
+        with open(tmp,"w") as f: json.dump(users,f,indent=2,ensure_ascii=False)
+        os.replace(tmp, USERS)
+    # перерисовать конфиг и рестарт sing-box
+    cmd = r"""python3 - <<'PY'
+import json
+cfg=json.load(open('/etc/hysteria/config.json'))
+users=json.load(open('/etc/hysteria/users.json'))
+cfg["inbounds"][0]["users"]=[{"name":k,"password":v["password"]} for k,v in users.items()]
+open('/etc/hysteria/config.json','w').write(json.dumps(cfg,indent=2))
+PY
+systemctl restart sing-box
+"""
+    subprocess.run(["bash","-lc", cmd], check=False)
+    return pw
+
+@rt.message(Command("start"))
+async def start(m: Message):
+    if m.from_user.id == ADMIN_ID:
+        await m.answer("Админ-режим.\nКоманды:\n/queue — заявки\n/approve <username> — выдать вручную")
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=t, callback_data=f"plan:{c}") for t,c in PLANS[:2]],
+            [InlineKeyboardButton(text=t, callback_data=f"plan:{c}") for t,c in PLANS[2:]],
+        ])
+        await m.answer("Привет! Выбери тариф:", reply_markup=kb)
+
+@rt.callback_query(F.data.startswith("plan:"))
+async def choose_plan(cq: CallbackQuery):
+    plan = cq.data.split(":",1)[1]
+    await cq.message.answer("Отправь фото оплаты и в подписи укажи желаемый логин (латиницей, без пробелов).")
+    with open(ORDERS,"r") as f: orders=json.load(f)
+    orders[str(cq.from_user.id)] = {"plan": plan}
+    with open(ORDERS,"w") as f: json.dump(orders,f)
+
+@rt.message(F.photo)
+async def on_photo(m: Message):
+    if m.from_user.id == ADMIN_ID:
+        return
+    with open(ORDERS,"r") as f: orders=json.load(f)
+    entry = orders.get(str(m.from_user.id), {})
+    if not entry.get("plan"):
+        return await m.reply("Сначала выбери тариф: /start")
+
+    if not m.caption:
+        return await m.reply("Добавь к фото подпись — желаемый логин (латиницей, без пробелов).")
+
+    username = m.caption.strip()
+    if " " in username:
+        return await m.reply("Логин без пробелов, латиницей. Пришли фото снова с подписью.")
+
+    entry["username"] = username
+    entry["photo_id"] = m.photo[-1].file_id
+    orders[str(m.from_user.id)] = entry
+    with open(ORDERS,"w") as f: json.dump(orders,f)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"ok:{m.from_user.id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no:{m.from_user.id}")]
+    ])
+    text = f"Заявка: @{m.from_user.username or m.from_user.id}\nТариф: {entry['plan']}\nЛогин: {username}"
+    try:
+        await bot.send_photo(ADMIN_ID, m.photo[-1].file_id, caption=text, reply_markup=kb)
+    except Exception:
+        await bot.send_message(ADMIN_ID, text, reply_markup=kb)
+
+    await m.reply("Спасибо! Заявка отправлена администратору.")
+
+@rt.callback_query(F.data.startswith("ok:"))
+async def admin_ok(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        return await cq.answer("Только админ.", show_alert=True)
+    uid = cq.data.split(":",1)[1]
+    with open(ORDERS,"r") as f: orders=json.load(f)
+    entry = orders.get(str(uid))
+    if not entry:
+        return await cq.answer("Заявки нет.", show_alert=True)
+
+    name = entry["username"]
+    pw = add_user(name)
+    uri = make_uri(name, pw)
+
+    # сообщить клиенту
+    try:
+        await bot.send_message(int(uid), f"✅ Доступ выдан!\nВот ваша ссылка:\n{uri}")
+    except Exception:
+        pass
+
+    await cq.message.edit_caption(caption=cq.message.caption + "\n\n✅ Подтверждено и выдано.")
+    await cq.answer("Выдано.")
+
+@rt.callback_query(F.data.startswith("no:"))
+async def admin_no(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        return await cq.answer("Только админ.", show_alert=True)
+    uid = cq.data.split(":",1)[1]
+    try:
+        await bot.send_message(int(uid), "Заявка отклонена. Если это ошибка — свяжитесь с поддержкой.")
+    except Exception:
+        pass
+    await cq.message.edit_caption(caption=cq.message.caption + "\n\n❌ Отклонено.")
+    await cq.answer("Отклонено.")
+
+@rt.message(Command("queue"))
+async def queue(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    with open(ORDERS,"r") as f: orders=json.load(f)
+    if not orders:
+        return await m.reply("Заявок нет.")
+    text = "Заявки:\n" + "\n".join([f"- {k}: {v}" for k,v in orders.items()])
+    await m.reply(text)
+
+@rt.message(Command("approve"))
+async def approve_cmd(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    parts = m.text.split()
+    if len(parts) < 2:
+        return await m.reply("Использование: /approve <username>")
+    name = parts[1]
+    pw = add_user(name)
+    uri = make_uri(name, pw)
+    await m.reply(f"Выдано: {name}\n{uri}")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+PY
+
+echo "[8/9] Виртуальное окружение и сервис бота"
+python3 -m venv /opt/hy2bot/venv
+/opt/hy2bot/venv/bin/pip install --upgrade pip >/dev/null
+/opt/hy2bot/venv/bin/pip install -r /opt/hy2bot/requirements.txt
+
+cat >/etc/systemd/system/hy2bot.service <<'UNIT'
+[Unit]
+Description=HY2 Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/hy2bot
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/hy2bot/venv/bin/python /opt/hy2bot/bot.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now hy2bot
+
+echo "[9/9] Готово!"
+echo "Проверка sing-box: systemctl status sing-box"
+echo "Проверка бота:     systemctl status hy2bot"
+echo
+echo "Основной клиент:"
+/usr/local/bin/mainuser || true
