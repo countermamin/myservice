@@ -12,6 +12,8 @@ apt update -y
 apt install -y curl wget jq qrencode socat unzip ufw python3 python3-venv python3-pip git
 
 echo "[2/9] UFW и BBR"
+ufw allow 22/tcp || true
+ufw allow 80/tcp || true
 ufw allow ${HY2_PORT}/tcp || true
 ufw allow ${HY2_PORT}/udp || true
 ufw --force enable || true
@@ -21,7 +23,7 @@ grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_q
 grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
 
 echo "[3/9] Сертификат Let's Encrypt для ${DOMAIN}"
-curl https://get.acme.sh | sh -s email=${LE_EMAIL}
+curl https://get.acme.sh | sh -s email=${LE_EMAIL} --force
 ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 mkdir -p /etc/hysteria/certs
 ~/.acme.sh/acme.sh --issue -d ${DOMAIN} --standalone --keylength ec-256
